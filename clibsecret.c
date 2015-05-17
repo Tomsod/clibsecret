@@ -34,6 +34,8 @@ static struct
     gboolean unlock;
     gboolean lock;
     gboolean show_keyring_info;
+    gboolean new_keyring;
+    gboolean delete_keyring;
     gboolean no_auto_unlock;
     gboolean new;
     gboolean delete;
@@ -56,8 +58,10 @@ static const GOptionEntry opt_entries[] =
         "Lock the keyring(s) when done", NULL },
       { "keyring-info", 'I', 0, G_OPTION_ARG_NONE, &options.show_keyring_info,
         "Print keyring info", NULL },
-      //new_keyring
-      //delete_keyring
+      { "new-keyring", 'N', 0, G_OPTION_ARG_NONE, &options.new_keyring,
+        "Create new keyring", NULL },
+      { "delete-keyring", 'D', 0, G_OPTION_ARG_NONE, &options.delete_keyring,
+        "Delete specified keyring", NULL },
       { "no-auto-unlock", 'U', 0, G_OPTION_ARG_NONE, &options.no_auto_unlock,
         "Exit with error if have to unlock anything", NULL },
 
@@ -149,10 +153,10 @@ parse_format(gchar *spec)
         struct format_parsed *parse = g_new(struct format_parsed, 1);
         parse->option = **chunk;
         parse->delim = g_strdup(*chunk + 1);
-        format = g_list_append(format, parse);
+        format = g_list_prepend(format, parse);
       }
     g_strfreev(chunks);
-    return format;
+    return g_list_reverse(format);
 }
 
 static void
@@ -310,6 +314,32 @@ out:
     if (free_item) g_object_unref(item);
 }
 
+static const gchar UNLOCK_ABORT[] = "Collection unlock requested; aborting\n";
+
+static GVariant *
+prompt_sync_dummy(SecretService *foo, SecretPrompt *bar, GCancellable *baz,
+                  const GVariantType *qux, GError **quux)
+{
+    g_critical(UNLOCK_ABORT);
+    return NULL;
+}
+
+static void
+prompt_async_dummy(SecretService *foo, SecretPrompt *bar,
+                   const GVariantType *baz, GCancellable *qux,
+                   GAsyncReadyCallback quux, gpointer corge)
+{
+    g_critical(UNLOCK_ABORT);
+    return;
+}
+
+static GVariant *
+prompt_finish_dummy(SecretService *foo, GAsyncResult *bar, GError **baz)
+{
+    g_critical(UNLOCK_ABORT);
+    return NULL;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -332,14 +362,16 @@ main(int argc, char *argv[])
     if (options.no_auto_unlock)
       {
         SecretServiceClass *class = SECRET_SERVICE_GET_CLASS(serv);
-        //extra hacky for now
-        class->prompt_sync = NULL;
-        class->prompt_async = NULL;
-        class->prompt_finish = NULL;
+        class->prompt_sync = &prompt_sync_dummy;
+        class->prompt_async = &prompt_async_dummy;
+        class->prompt_finish = &prompt_finish_dummy;
       }
 
     SecretCollection *collection = NULL;
-    if (options.alias)
+    if (options.new_keyring)
+        collection = secret_collection_create_sync(serv, options.keyring,
+                                                 options.alias, 0, NULL, NULL);
+    else if (options.alias)
         collection = secret_collection_for_alias_sync(serv, options.alias,
                                      SECRET_COLLECTION_LOAD_ITEMS, NULL, NULL);
     else if (options.keyring)
@@ -356,7 +388,8 @@ main(int argc, char *argv[])
         secret_service_unlock_sync(serv, collections, NULL, NULL, NULL);
 
     if (options.show_keyring_info)
-        // header?
+      {
+        printf("label\tstate\tctime\t\t\tmtime\n");
         for (GList *elem = collections; elem; elem = elem->next)
           {
             const char UNKNOWN[] = "unknown\t\t";
@@ -373,6 +406,7 @@ main(int argc, char *argv[])
             g_free(mtime);
             g_free(label);
           }
+      }
 
     if (options.read)
       {
@@ -504,6 +538,9 @@ main(int argc, char *argv[])
 
     if (options.lock)
         secret_service_lock_sync(serv, collections, NULL, NULL, NULL);
+
+    if (options.delete_keyring)
+        secret_collection_delete_sync(collection, NULL, NULL);
 
     g_list_free_full(collections, &g_object_unref);
     secret_service_disconnect();
