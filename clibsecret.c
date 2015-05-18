@@ -20,12 +20,14 @@
 #include <libsecret/secret.h>
 #include <gio/gio.h> // g_dbus_proxy_get_object_path()
 
-#include <stdio.h> // printf(), fgets()
+#include <stdio.h> // printf(), fgets(), fputs()
 #include <string.h> // strchr(), strstr(), strlen()
 #include <unistd.h> // getpass()
 
-static const char SUMMARY[] = " [LABEL] [ATTRIBUTE VALUE...]"
-                              " - manage libsecret collections";
+#define print(string) fputs(string, stdout)
+
+static const gchar SUMMARY[] = " [LABEL] [ATTRIBUTE VALUE...]"
+                               " - manage libsecret collections";
 
 static struct
 {
@@ -82,11 +84,20 @@ static const GOptionEntry opt_entries[] =
       { NULL }
 };
 
+/// For --read and --info. Corresponds to string "%" + option + delim.
 struct format_parsed
 {
     gchar option;
     gchar *delim;
 };
+
+void
+format_parsed_free(gpointer format)
+{
+    struct format_parsed *self = format;
+    g_free(self->delim);
+    g_free(self);
+}
 
 static const gchar TEXT_PLAIN[] = "text/plain";
 
@@ -102,6 +113,7 @@ print_time(const gchar *unknown, guint64 time)
     else return g_strdup(unknown);
 }
 
+/// Callback for g_hash_table_foreach(). Basically, it clones the table.
 static void
 ght_add(gpointer key, gpointer value, gpointer user_data)
 {
@@ -127,16 +139,18 @@ find_collection(SecretService *service, gchar *label)
         g_free(col_label);
       }
     g_list_free_full(all_collections, &g_object_unref);
+    if (!collection) g_warning("Could not find collection \"%s\"!", label);
     return collection;
 }
 
+/// e.g. "foo %i bar" -> { {0, "foo "}, {'i', " bar"}}
 static GList *
 parse_format(gchar *spec)
 {
     gchar **chunks = g_strsplit(spec, "%", -1);
     struct format_parsed *first = g_new(struct format_parsed, 1);
     first->option = 0;
-    first->delim = g_strdup(*chunks);
+    first->delim = g_strdup(chunks[0]);
     GList *format = g_list_append(NULL, first);
     for (gchar **chunk = &chunks[1]; *chunk; chunk++)
       {
@@ -144,8 +158,9 @@ parse_format(gchar *spec)
           {
             // "%%" format
             chunk++;
-            gchar *old = format->data;
-            format->data = g_strconcat(old, "%", *chunk, NULL);
+            struct format_parsed *elem = format->data;
+            gchar *old = elem->delim;
+            elem->delim = g_strconcat(old, "%", *chunk, NULL);
             g_free(old);
             if (!*chunk) break;
             else continue;
@@ -159,39 +174,64 @@ parse_format(gchar *spec)
     return g_list_reverse(format);
 }
 
+/// Initialised and used in process_item(), freed in main()
+static GList *info_parsed = NULL;
+
+/**
+ * Most item options are handled here.
+ * Parameters (except 'item') are what needs to be changed.
+ */
 static void
 process_item(SecretItem *item, SecretCollection *collection, gchar *label,
              GHashTable *attributes, SecretValue *secret)
 {
+    GError *error = NULL;
     if (!secret && options.change_secret)
       {
+        //TODO: secret for what?
         const char PROMPT[] = "Enter new secret: ";
         char *password = getpass(PROMPT);
-        secret = secret_value_new(password, -1, TEXT_PLAIN);
+        if (!password) g_warning("Error reading the secret.");
+        else secret = secret_value_new(password, -1, TEXT_PLAIN);
       }
 
     gboolean free_item = FALSE;
     if (options.new)
       {
-        if (!collection)
-            g_warning("Cannot create item: collection not specified");
+        if (!label)
+            g_warning("Cannot create item: label not specified");
+        else if (!collection)
+            g_warning("Cannot create item \"%s\": collection not specified",
+                      label);
         else
           {
             item = secret_item_create_sync(collection, NULL, attributes, label,
-                                  secret, SECRET_ITEM_CREATE_NONE, NULL, NULL);
-            free_item = TRUE;
+                                secret, SECRET_ITEM_CREATE_NONE, NULL, &error);
+            if (!item)
+                g_warning("Could not create item \"%s\": %s",
+                          label, error->message);
+            else free_item = TRUE;
           }
       }
-    else if (!item)
-        g_warning("ID not specified, skipping");
-    else
+    else if (item)
       {
-        if (label) secret_item_set_label_sync(item, label, NULL, NULL);
-        if (secret) secret_item_set_secret_sync(item, secret,
-                                                  NULL, NULL);
+        if (label)
+            if (!secret_item_set_label_sync(item, label, NULL, &error))
+                g_warning("Couldn't change the label to \"%s\": %s",
+                          label, error->message);
+        if (secret)
+            if (secret_item_set_secret_sync(item, secret, NULL, &error))
+                g_warning("Couldn't change the secret: %s", error->message);
         if (attributes && g_hash_table_size(attributes) > 0)
-            secret_item_set_attributes_sync(item, NULL, attributes,
-                                            NULL, NULL);
+            if (secret_item_set_attributes_sync(item, NULL, attributes,
+                                                NULL, &error))
+                g_warning("Couldn't change attributes: %s", error->message);
+      }
+
+    if (!item)
+      {
+        g_warning("Item not specified, skipping");
+        return;
       }
 
     if (options.info)
@@ -200,13 +240,12 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
         GHashTable *item_attrs;
         GHashTableIter iter;
         gboolean init_iter = FALSE;
-        gboolean end_iter = FALSE;
         gpointer attr_name = NULL;
         gpointer attr_value = NULL;
         gchar *ctime = NULL;
         gchar *mtime = NULL;
-        GList *format = parse_format(options.info);
-        GList *elem = format;
+        if (!info_parsed) info_parsed = parse_format(options.info);
+        GList *elem = info_parsed;
         GList *format_A = NULL;
         do for (elem; elem; elem = elem->next)
           {
@@ -214,28 +253,29 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
             const gchar UNKNOWN[] = "unknown";
             switch (parse->option)
               {
-                case '\0':
+                case  0 :
                     break;
                 case 'i':
-                    printf(g_dbus_proxy_get_object_path
-                           (&item->parent_instance));
+                    print(g_dbus_proxy_get_object_path
+                          (&item->parent_instance));
                     break;
                 case 'l':
-                    printf(secret_item_get_label(item));
+                    print(secret_item_get_label(item));
                     break;
                 case 's':
                     if (!secret)
                       {
-                        secret_item_load_secret_sync(item, NULL, NULL);
+                        if (!secret_item_load_secret_sync(item, NULL, &error))
+                            g_warning("Failed to load secret: %s",
+                                      error->message);
                         secret = secret_item_get_secret(item);
                       }
-                    printf(secret_value_get_text(secret));
+                    if (secret) print(secret_value_get_text(secret));
                     break;
                 case 'A':
                     format_A = elem;
                     //FALLTHROUGH
                 case 'a':
-                    if (end_iter) break;
                     if (!init_iter)
                       {
                         item_attrs = secret_item_get_attributes(item);
@@ -244,15 +284,11 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
                       }
                     if (!attr_name && !g_hash_table_iter_next(&iter,
                                                       &attr_name, &attr_value))
-                      {
-                        end_iter = TRUE;
                         goto out;
-                      }
-                    printf(attr_name);
+                    print(attr_name);
                     attr_name = NULL;
                     break;
                 case 'v':
-                    if (end_iter) break;
                     if (!init_iter)
                       {
                         item_attrs = secret_item_get_attributes(item);
@@ -261,60 +297,64 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
                       }
                     if (!attr_value && !g_hash_table_iter_next(&iter,
                                                       &attr_name, &attr_value))
-                      {
-                        end_iter = TRUE;
                         goto out;
-                      }
-                    printf(attr_value);
+                    print(attr_value);
                     attr_value = NULL;
                     break;
                 case 't':
                     if (!ctime) ctime = print_time(UNKNOWN,
                                                 secret_item_get_created(item));
-                    printf(ctime);
+                    print(ctime);
                     break;
                 case 'm':
                     if (!mtime) mtime = print_time(UNKNOWN,
                                                secret_item_get_modified(item));
-                    printf(mtime);
+                    print(mtime);
                     break;
                 default:
                     g_warning("Unrecognized format specifier: %c\n",
                               parse->option);
                     break;
               }
-            printf(parse->delim);
+            print(parse->delim);
           }
         while (elem = format_A);
-out:
-        printf("\n");
+        out:
+        print("\n");
         if (secret) secret_value_unref(secret);
         if (init_iter) g_hash_table_unref(item_attrs);
         g_free(ctime);
         g_free(mtime);
-        g_list_free_full(format, &g_free);
       }
     if (options.move)
-      {
-        GHashTable *attributes = secret_item_get_attributes(item);
-        gchar *label = secret_item_get_label(item);
-        secret_item_load_secret_sync(item, NULL, NULL);
-        SecretValue *secret = secret_item_get_secret(item);
-        SecretItem *new_item = secret_item_create_sync(collection,
+        if (!collection)
+            g_warning("Cannot copy item: collection not specified");
+        else
+          {
+            GHashTable *attributes = secret_item_get_attributes(item);
+            gchar *label = secret_item_get_label(item);
+            if (!secret_item_load_secret_sync(item, NULL, &error))
+                g_warning("Failed to load secret: %s", error->message);
+            SecretValue *secret = secret_item_get_secret(item);
+            if (secret)
+              {
+                SecretItem *new_item = secret_item_create_sync(collection,
                                                NULL, attributes, label, secret,
                                        SECRET_ITEM_CREATE_REPLACE, NULL, NULL);
-        g_object_unref(new_item);
-        if (secret) secret_value_unref(secret);
-        g_free(label);
-        g_hash_table_unref(attributes);
-      }
+                g_object_unref(new_item);
+                secret_value_unref(secret);
+              }
+            g_free(label);
+            g_hash_table_unref(attributes);
+          }
     if (options.delete)
-        secret_item_delete_sync(item, NULL, NULL);
+        if (!secret_item_delete_sync(item, NULL, &error))
+            g_warning("Could not delete item: %s", error->message);
 
     if (free_item) g_object_unref(item);
 }
 
-static const gchar UNLOCK_ABORT[] = "Collection unlock requested; aborting\n";
+static const gchar UNLOCK_ABORT[] = "Collection unlock requested; aborting";
 
 static GVariant *
 prompt_sync_dummy(SecretService *foo, SecretPrompt *bar, GCancellable *baz,
@@ -349,7 +389,7 @@ main(int argc, char *argv[])
     GOptionContext *opt_context = g_option_context_new(SUMMARY);
     g_option_context_add_main_entries(opt_context, opt_entries, NULL);
     if (!g_option_context_parse(opt_context, &argc, &argv, &error))
-        g_critical("Option parse error: %s\n", error->message);
+        g_critical("Option parse error: %s", error->message);
     GHashTable *attributes = g_hash_table_new(&g_str_hash, &g_str_equal);
     int arg = 1;
     char *name = NULL;
@@ -389,7 +429,8 @@ main(int argc, char *argv[])
 
     if (options.show_keyring_info)
       {
-        printf("label\tstate\tctime\t\t\tmtime\n");
+        //TODO: list known aliases?
+        print("label\tstate\tctime\t\t\tmtime\n");
         for (GList *elem = collections; elem; elem = elem->next)
           {
             const char UNKNOWN[] = "unknown\t\t";
@@ -411,7 +452,7 @@ main(int argc, char *argv[])
     if (options.read)
       {
         GList *format = parse_format(options.read);
-#define BIG_NUMBER 1024
+        #define BIG_NUMBER 1024
         char buffer[BIG_NUMBER];
         for (char *line = fgets(buffer, sizeof buffer, stdin); line;
              line = fgets(buffer, sizeof buffer, stdin))
@@ -513,7 +554,7 @@ main(int argc, char *argv[])
             g_free(value);
             g_hash_table_unref(r_attrs);
           }
-        g_list_free_full(format, &g_free);
+        g_list_free_full(format, &format_parsed_free);
       }
     else if (options.new)
         process_item(NULL, collection, name, attributes, secret);
@@ -535,6 +576,7 @@ main(int argc, char *argv[])
         g_list_free_full(item_list, &g_object_unref);
       }
     if (secret) secret_value_unref(secret);
+    if (info_parsed) g_list_free_full(info_parsed, &format_parsed_free);
 
     if (options.lock)
         secret_service_lock_sync(serv, collections, NULL, NULL, NULL);
