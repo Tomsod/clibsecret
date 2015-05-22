@@ -99,6 +99,7 @@ format_parsed_free(gpointer format)
     g_free(self);
 }
 
+//TODO: configurable type?
 static const gchar TEXT_PLAIN[] = "text/plain";
 
 static gchar *
@@ -143,7 +144,7 @@ find_collection(SecretService *service, gchar *label)
     return collection;
 }
 
-/// e.g. "foo %i bar" -> { {0, "foo "}, {'i', " bar"}}
+/// e.g. "foo %i bar" -> {{0, "foo "}, {'i', " bar"}}
 static GList *
 parse_format(gchar *spec)
 {
@@ -207,9 +208,12 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
           {
             item = secret_item_create_sync(collection, NULL, attributes, label,
                                 secret, SECRET_ITEM_CREATE_NONE, NULL, &error);
-            if (!item)
+            if (error)
+              {
                 g_warning("Could not create item \"%s\": %s",
                           label, error->message);
+                g_clear_error(&error);
+              }
             else free_item = TRUE;
           }
       }
@@ -217,15 +221,24 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
       {
         if (label)
             if (!secret_item_set_label_sync(item, label, NULL, &error))
+              {
                 g_warning("Couldn't change the label to \"%s\": %s",
                           label, error->message);
+                g_clear_error(&error);
+              }
         if (secret)
-            if (secret_item_set_secret_sync(item, secret, NULL, &error))
+            if (!secret_item_set_secret_sync(item, secret, NULL, &error))
+              {
                 g_warning("Couldn't change the secret: %s", error->message);
+                g_clear_error(&error);
+              }
         if (attributes && g_hash_table_size(attributes) > 0)
-            if (secret_item_set_attributes_sync(item, NULL, attributes,
-                                                NULL, &error))
+            if (!secret_item_set_attributes_sync(item, NULL, attributes,
+                                                 NULL, &error))
+              {
                 g_warning("Couldn't change attributes: %s", error->message);
+                g_clear_error(&error);
+              }
       }
 
     if (!item)
@@ -266,8 +279,11 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
                     if (!secret)
                       {
                         if (!secret_item_load_secret_sync(item, NULL, &error))
+                          {
                             g_warning("Failed to load secret: %s",
                                       error->message);
+                            g_clear_error(&error);
+                          }
                         secret = secret_item_get_secret(item);
                       }
                     if (secret) print(secret_value_get_text(secret));
@@ -312,7 +328,7 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
                     print(mtime);
                     break;
                 default:
-                    g_warning("Unrecognized format specifier: %c\n",
+                    g_warning("Unrecognized format specifier: %c",
                               parse->option);
                     break;
               }
@@ -334,14 +350,22 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
             GHashTable *attributes = secret_item_get_attributes(item);
             gchar *label = secret_item_get_label(item);
             if (!secret_item_load_secret_sync(item, NULL, &error))
+              {
                 g_warning("Failed to load secret: %s", error->message);
+                g_clear_error(&error);
+              }
             SecretValue *secret = secret_item_get_secret(item);
             if (secret)
               {
                 SecretItem *new_item = secret_item_create_sync(collection,
                                                NULL, attributes, label, secret,
-                                       SECRET_ITEM_CREATE_REPLACE, NULL, NULL);
-                g_object_unref(new_item);
+                                     SECRET_ITEM_CREATE_REPLACE, NULL, &error);
+                if (error)
+                  {
+                    g_warning("Couldn't move item: %s", error->message);
+                    g_clear_error(&error);
+                  }
+                else g_object_unref(new_item);
                 secret_value_unref(secret);
               }
             g_free(label);
@@ -349,7 +373,10 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
           }
     if (options.delete)
         if (!secret_item_delete_sync(item, NULL, &error))
+          {
             g_warning("Could not delete item: %s", error->message);
+            g_clear_error(&error);
+          }
 
     if (free_item) g_object_unref(item);
 }
@@ -398,7 +425,9 @@ main(int argc, char *argv[])
         g_hash_table_insert(attributes, argv[arg], argv[arg+1]);
 
     SecretService *serv = secret_service_get_sync(SECRET_SERVICE_OPEN_SESSION
-                                | SECRET_SERVICE_LOAD_COLLECTIONS, NULL, NULL);
+                              | SECRET_SERVICE_LOAD_COLLECTIONS, NULL, &error);
+    if (error)
+        g_critical("Error while obtaining service proxy: %s", error->message);
     if (options.no_auto_unlock)
       {
         SecretServiceClass *class = SECRET_SERVICE_GET_CLASS(serv);
@@ -409,11 +438,26 @@ main(int argc, char *argv[])
 
     SecretCollection *collection = NULL;
     if (options.new_keyring)
+      {
         collection = secret_collection_create_sync(serv, options.keyring,
-                                                 options.alias, 0, NULL, NULL);
+                                               options.alias, 0, NULL, &error);
+        if (error)
+          {
+            g_warning("Failed to create collection: %s", error->message);
+            g_clear_error(&error);
+          }
+      }
     else if (options.alias)
+      {
         collection = secret_collection_for_alias_sync(serv, options.alias,
-                                     SECRET_COLLECTION_LOAD_ITEMS, NULL, NULL);
+                                   SECRET_COLLECTION_LOAD_ITEMS, NULL, &error);
+        if (error)
+          {
+            g_warning("Could not find collection for alias \"%s\": %s",
+                      options.alias, error->message);
+            g_clear_error(&error);
+          }
+      }
     else if (options.keyring)
         collection = find_collection(serv, options.keyring);
     GList *collections;
@@ -425,7 +469,12 @@ main(int argc, char *argv[])
         secret = secret_value_new(options.secret, -1, TEXT_PLAIN);
 
     if (options.unlock)
-        secret_service_unlock_sync(serv, collections, NULL, NULL, NULL);
+      {
+        secret_service_unlock_sync(serv, collections, NULL, NULL, &error);
+        if (error)
+            g_warning("Couldn't unlock the collection(s): %s", error->message);
+        g_clear_error(&error);
+      }
 
     if (options.show_keyring_info)
       {
@@ -496,7 +545,15 @@ main(int argc, char *argv[])
                             break;
                         case 'C':
                             r_col = secret_collection_for_alias_sync(serv,
-                              token, SECRET_COLLECTION_LOAD_ITEMS, NULL, NULL);
+                                           token, SECRET_COLLECTION_LOAD_ITEMS,
+                                                                 NULL, &error);
+                            if (error)
+                              {
+                                g_warning("Couldn't find collection with"
+                                          " alias \"%s\": %s", token,
+                                          error->message);
+                                g_clear_error(&error);
+                              }
                             break;
                         case 'l':
                             label = token;
@@ -542,11 +599,20 @@ main(int argc, char *argv[])
               }
             while (line && *line && (elem = format_A));
             SecretItem *item = NULL;
-            if (id) item = secret_item_new_for_dbus_path_sync(serv,
-                                             id, SECRET_ITEM_NONE, NULL, NULL);
+            if (id)
+              {
+                item = secret_item_new_for_dbus_path_sync(serv,
+                                           id, SECRET_ITEM_NONE, NULL, &error);
+                if (error)
+                  {
+                    g_warning("Failed to find item with ID \"%s\": %s", id,
+                              error->message);
+                    g_clear_error(&error);
+                  }
+              }
             g_free(id);
             process_item(item, r_col, label, r_attrs, r_secret);
-            g_object_unref(item);
+            if (item) g_object_unref(item);
             if (label != name) g_free(label);
             if (r_secret != secret) secret_value_unref(r_secret);
             if (r_col != collection) g_object_unref(r_col);
@@ -563,9 +629,11 @@ main(int argc, char *argv[])
         GList *item_list;
         if (collection && !options.move)
             item_list = secret_collection_search_sync(collection, NULL,
-                                    attributes, SECRET_SEARCH_ALL, NULL, NULL);
+                                  attributes, SECRET_SEARCH_ALL, NULL, &error);
         else item_list = secret_service_search_sync(serv, NULL, attributes,
-                                                SECRET_SEARCH_ALL, NULL, NULL);
+                                              SECRET_SEARCH_ALL, NULL, &error);
+        if (error)
+            g_critical("Failed to get matched items: %s", error->message);
         for (GList *elem = item_list; elem; elem = elem->next)
           {
             SecretItem *item = elem->data;
@@ -578,11 +646,22 @@ main(int argc, char *argv[])
     if (secret) secret_value_unref(secret);
     if (info_parsed) g_list_free_full(info_parsed, &format_parsed_free);
 
-    if (options.lock)
-        secret_service_lock_sync(serv, collections, NULL, NULL, NULL);
-
     if (options.delete_keyring)
-        secret_collection_delete_sync(collection, NULL, NULL);
+        if (!secret_collection_delete_sync(collection, NULL, &error))
+          {
+            g_warning("Failed to delete collection(s): %s", error->message);
+            g_clear_error(&error);
+          }
+
+    if (options.lock)
+      {
+        secret_service_lock_sync(serv, collections, NULL, NULL, &error);
+        if (error)
+          {
+            g_warning("Error while locking collection(s): %s", error->message);
+            g_clear_error(&error);
+          }
+      }
 
     g_list_free_full(collections, &g_object_unref);
     secret_service_disconnect();
