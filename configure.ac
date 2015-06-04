@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.69])
-AC_INIT([clibsecret], [0.1], [tomsod-m@ya.ru])
+AC_INIT([clibsecret], [0.8], [tomsod-m@ya.ru])
 AM_INIT_AUTOMAKE([foreign])
 AC_CONFIG_SRCDIR([clibsecret.c])
 AC_CONFIG_HEADERS([config.h])

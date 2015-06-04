@@ -26,7 +26,7 @@
 
 #define print(string) fputs(string, stdout)
 
-static const gchar SUMMARY[] = " [LABEL] [ATTRIBUTE VALUE...]"
+static const gchar SUMMARY[] = "[LABEL] [ATTRIBUTE VALUE...]"
                                " - manage libsecret collections";
 
 static struct
@@ -83,6 +83,28 @@ static const GOptionEntry opt_entries[] =
         "Prompt for new item secret", NULL },
       { NULL }
 };
+
+static const char DESCRIPTION[] =
+    "FORMAT consists of %-prefixed specifiers separated by delimiters.\n"
+    "Note that when using --read, every delimiter, including whitespace,\n"
+    "must match exactly.\n"
+    "\n"
+    "Valid specifiers are:\n"
+    "\n"
+    "%i - item D-Bus ID.\n"
+    "%l - item label.\n"
+    "%s - item secret.\n"
+    "%a - next attribute.\n"
+    "%A - next attribute; if format string ends before all attributes are\n"
+          "\texhausted, it is re-parsed from last %A.\n"
+    "%v - next value.\n"
+    "%c - new collection.\n"
+    "%C - new collection by alias.\n"
+    "%t - item creation time.\n"
+    "%m - item modify time.\n"
+    "%* - this specifier is parsed and discarded.\n"
+    "%% - matches a single percent sign.\n"
+    ;
 
 /// For --read and --info. Corresponds to string "%" + option + delim.
 struct format_parsed
@@ -415,8 +437,11 @@ main(int argc, char *argv[])
 
     GOptionContext *opt_context = g_option_context_new(SUMMARY);
     g_option_context_add_main_entries(opt_context, opt_entries, NULL);
+    g_option_context_set_description(opt_context, DESCRIPTION);
     if (!g_option_context_parse(opt_context, &argc, &argv, &error))
         g_critical("Option parse error: %s", error->message);
+    g_option_context_free(opt_context);
+
     GHashTable *attributes = g_hash_table_new(&g_str_hash, &g_str_equal);
     int arg = 1;
     char *name = NULL;
@@ -460,6 +485,11 @@ main(int argc, char *argv[])
       }
     else if (options.keyring)
         collection = find_collection(serv, options.keyring);
+    if ((!collection || options.move) && argc == 1 && (options.move
+                                              || options.delete || options.info
+                                   || options.secret || options.change_secret))
+        // default action
+        options.read = g_strdup("%i");
     GList *collections;
     if (collection) collections = g_list_append(NULL, collection);
     else collections = secret_service_get_collections(serv);
@@ -472,24 +502,55 @@ main(int argc, char *argv[])
       {
         secret_service_unlock_sync(serv, collections, NULL, NULL, &error);
         if (error)
+          {
             g_warning("Couldn't unlock the collection(s): %s", error->message);
-        g_clear_error(&error);
+            g_clear_error(&error);
+          }
       }
 
     if (options.show_keyring_info)
       {
-        //TODO: list known aliases?
-        print("label\tstate\tctime\t\t\tmtime\n");
+        print("LABEL\tALIAS\tSTATE\tCTIME\t\t\tMTIME\n");
         for (GList *elem = collections; elem; elem = elem->next)
           {
             const char UNKNOWN[] = "unknown\t\t";
+            const gchar *const aliases[] =
+              {
+                "session",
+                "default",
+                ""
+              };
             SecretCollection *col = elem->data;
             gchar *ctime = print_time(UNKNOWN,
                                       secret_collection_get_created(col));
             gchar *mtime = print_time(UNKNOWN,
                                       secret_collection_get_modified(col));
             gchar *label = secret_collection_get_label(col);
-            printf("%s\t%s\t%s\t%s\n", *label ? label : "unnamed",
+            const gchar *alias_path =
+                g_dbus_proxy_get_object_path(&col->parent);
+            const gchar *const *alias;
+            for (alias = aliases; **alias; alias++)
+              {
+                gchar *test_path =
+                    secret_service_read_alias_dbus_path_sync(serv, *alias,
+                                                             NULL, &error);
+                if (error)
+                  {
+                    g_warning("Error while testing aliases: %s",
+                              error->message);
+                    g_clear_error(&error);
+                  }
+                if (test_path)
+                  {
+                    if (!g_strcmp0(alias_path, test_path))
+                      {
+                        g_free(test_path);
+                        break;
+                      }
+                    g_free(test_path);
+                  }
+              }
+            printf("%s\t%s\t%s\t%s\t%s\n", label, *alias,
                    secret_collection_get_locked(col) ? "locked" : "open",
                    ctime, mtime);
             g_free(ctime);
@@ -634,6 +695,14 @@ main(int argc, char *argv[])
                                               SECRET_SEARCH_ALL, NULL, &error);
         if (error)
             g_critical("Failed to get matched items: %s", error->message);
+        // basically: if we are supplied with specifiers,
+        // but have got nothing to do with them
+        if (!options.move && !options.delete && !options.info
+            && !options.secret && !options.change_secret
+            && (collection && !options.new_keyring && !options.delete_keyring
+                && !options.unlock && !options.lock || argc > 1))
+            // default action
+            options.info = g_strdup("%i");
         for (GList *elem = item_list; elem; elem = elem->next)
           {
             SecretItem *item = elem->data;
@@ -664,5 +733,10 @@ main(int argc, char *argv[])
       }
 
     g_list_free_full(collections, &g_object_unref);
+    g_free(options.keyring);
+    g_free(options.alias);
+    g_free(options.read);
+    g_free(options.info);
+    g_free(options.secret);
     secret_service_disconnect();
 }
