@@ -15,6 +15,11 @@
  *    limitations under the License.
  */
 
+
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include <glib.h>
 #define SECRET_API_SUBJECT_TO_CHANGE
 #include <libsecret/secret.h>
@@ -293,6 +298,12 @@ process_item(SecretItem *item, SecretCollection *collection, gchar *label,
                 case 'i':
                     print(g_dbus_proxy_get_object_path
                           (&item->parent_instance));
+                    break;
+                case 'c':
+                    if (options.keyring) print(options.keyring);
+                    break;
+                case 'C':
+                    if (options.alias) print(options.alias);
                     break;
                 case 'l':
                     print(secret_item_get_label(item));
